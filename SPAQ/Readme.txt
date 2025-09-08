@@ -32,7 +32,7 @@ zip -FF SPAQ.z01 --out SPAQ_1.zip
 Fix archive (-FF) - salvage what can
 	zip warning: Missing end (EOCDR) signature - either this archive
                      is not readable or the end is damaged
-Is this a single-disk archive?  (y/n): y
+Is this a single-disk archive?  (y/n): n
 ```
 
 step2: unzip SPAQ_x.zip
