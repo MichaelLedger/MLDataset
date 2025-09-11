@@ -1,4 +1,12 @@
-# Machine Learning Dataset Collection.
+# The Visual Quality Databases
+
+## [Image quality assessment datasets](https://database.mmsp-kn.de)
+
+[SPAQ: Perceptual Quality Assessment of Smartphone Photography](https://github.com/h4nwei/SPAQ)
+
+[KonIQ-10k IQA Database: ​An ecologically valid image quality assessment database](https://database.mmsp-kn.de/koniq-10k-database.html)
+
+[UHD-IQA Benchmark Database​: A high-resolution NR-IQA database for high-quality authentic photos](https://database.mmsp-kn.de/uhd-iqa-benchmark-database.html)
 
 ## Download Links
 
