@@ -2,5 +2,7 @@
 *.png
 *.jpeg
 *.gif
+*.tiff
+*.tif
 *.zip
 *.z0*
