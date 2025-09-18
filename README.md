@@ -26,4 +26,7 @@ You can download the LIVEC, BID, SPAQ, KonIQ and UHDIQA datasets from the follow
 
 ## Reference
 
+[Croissant](https://github.com/mlcommons/croissant)
+
 [MobileIQA: Exploiting Mobile-level Diverse Opinion Network For No-Reference Image Quality Assessment Using Knowledge Distillation](https://github.com/chencn2020/MobileIQA)
+

@@ -56,3 +56,15 @@ Label:
 
 EXIF tags:
 11125 pictures EXIF in Annotations/EXIF_tags.xlsx
+
+# Low quality dataset from Kaggle
+https://www.kaggle.com/datasets/anamikakumari22/spaq-dataset
+
+```
+import kagglehub
+
+# Download latest version
+path = kagglehub.dataset_download("anamikakumari22/spaq-dataset")
+
+print("Path to dataset files:", path)
+```
