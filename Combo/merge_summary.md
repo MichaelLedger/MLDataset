@@ -1,4 +1,4 @@
-# Combo Dataset CSV Merge Summary
+# Combo Dataset (UHD+PIQ) CSV Merge Summary
 
 ## Overview
 This document summarizes the process of merging PIQ2023 and UHD-IQA CSV files in the Combo directory to create unified training and validation datasets.
