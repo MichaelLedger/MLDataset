@@ -4,5 +4,7 @@
 *.gif
 *.tiff
 *.tif
+*.webp
 *.zip
 *.z0*
+*.pth
