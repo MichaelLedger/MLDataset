@@ -41,6 +41,9 @@ python laion_aesthetic_scorer.py ./my_images
 | `input_dir` | Directory containing images (required). Only **direct** children of this folder are scored (not subfolders). |
 | `-o`, `--output` | Path to the output CSV. If omitted, see **Default output path** below. |
 | `--install` | Install listed dependencies via `pip` and exit. |
+| `--no-relative-scale` | Disable the default **batch** stretch (see below). |
+| `--laion-center X` | Model logit mapped to **raw_score** 5.5 (default `5.5`). |
+| `--laion-scale S` | Steepness of sigmoid (smaller = more spread from tiny logit differences; default `0.11`). |
 
 ## Default output path
 
@@ -66,8 +69,15 @@ Columns:
 |--------|---------|
 | `filename` | Base name of the image |
 | `filepath` | Full path to the image |
-| `aesthetic_score` | Numeric score (1–10 scale after clamping in normal mode) |
-| `category` | `exciting`, `moderate`, or `boring/meaningless` (see below) |
+| `model_logit` | Direct regression output from the LAION head (before calibration). |
+| `raw_score` | **Global** 1–10: sigmoid map of `model_logit` using `--laion-center` / `--laion-scale` (no batch statistics). |
+| `aesthetic_score` | **Folder-relative:** p5–p95 of `model_logit` mapped to 1–10 for sorting within this run. |
+| `rank` | `1` = best in this folder (by `aesthetic_score`). |
+| `category` | From **global** `raw_score`. |
+
+**CLIP fallback:** `raw_score` is the CLIP similarity score clamped to 1–10; `model_logit` holds the same raw value.
+
+With `--no-relative-scale`, `aesthetic_score` equals `raw_score`.
 
 ## Score categories
 

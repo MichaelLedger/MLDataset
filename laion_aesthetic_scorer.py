@@ -22,11 +22,12 @@ MODEL:
 import os
 import sys
 import csv
+import math
 import time
 import argparse
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 
 # HEIC support
 try:
@@ -72,6 +73,27 @@ except ImportError:
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
+# Batch-independent calibration: typical shunk031 head outputs ~5.2–5.9 for phone photos.
+# Tune with --laion-center / --laion-scale if your corpus sits elsewhere.
+DEFAULT_LAION_LOGIT_CENTER = 5.5
+DEFAULT_LAION_LOGIT_SCALE = 0.11
+
+
+def _sigmoid(x: float) -> float:
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
+
+
+def laion_logit_to_raw_score_1_10(logit: float, center: float, scale: float) -> float:
+    """Map model logit to 1..10 without using batch stats (works for homogeneous folders)."""
+    if scale <= 0:
+        scale = 1e-6
+    z = (logit - center) / scale
+    return 1.0 + 9.0 * _sigmoid(z)
+
 
 def _is_transient_hub_error(err: Exception) -> bool:
     msg = str(err).lower()
@@ -98,6 +120,41 @@ def hf_retry(fn: Callable[[], Any], desc: str, retries: int = 5, base_delay: flo
             time.sleep(wait)
     assert last is not None
     raise last
+
+
+def batch_percentile_scale_1_10(
+    scores: List[float], low_pct: float = 5.0, high_pct: float = 95.0
+) -> List[float]:
+    """
+    Stretch scores to 1..10 using the batch's low/high percentiles as anchors.
+    Improves sorting when raw model outputs sit in a narrow band (typical for similar photos).
+    """
+    n = len(scores)
+    if n == 0:
+        return []
+    if n == 1:
+        return [5.0]
+    t = torch.tensor(scores, dtype=torch.float64)
+    lo = torch.quantile(t, low_pct / 100.0).item()
+    hi = torch.quantile(t, high_pct / 100.0).item()
+    span = hi - lo
+    if span < 1e-9:
+        return [5.0] * n
+    out: List[float] = []
+    for s in scores:
+        u = (s - lo) / span
+        u = max(0.0, min(1.0, u))
+        out.append(1.0 + 9.0 * u)
+    return out
+
+
+def ranks_higher_better(scores: List[float]) -> List[int]:
+    """1 = best (highest score). Ties get sequential ranks after sorting stable."""
+    indexed = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    rank_by_pos = [0] * len(scores)
+    for r, (idx, _) in enumerate(indexed, start=1):
+        rank_by_pos[idx] = r
+    return rank_by_pos
 
 
 class AestheticScorer:
@@ -193,7 +250,6 @@ class AestheticScorer:
                 else:
                     outputs = self.model(pixel_values=pixel_values)
                     score = outputs.logits.squeeze().item()
-                    score = max(1.0, min(10.0, float(score)))
 
             return float(score)
 
@@ -212,7 +268,13 @@ def categorize(score: float) -> str:
         return "boring/meaningless"
 
 
-def score_directory(input_dir: str, output_csv: str):
+def score_directory(
+    input_dir: str,
+    output_csv: str,
+    relative_scale: bool = True,
+    laion_center: float = DEFAULT_LAION_LOGIT_CENTER,
+    laion_scale: float = DEFAULT_LAION_LOGIT_SCALE,
+) -> List[dict]:
     """Score directory of images."""
     input_path = Path(input_dir)
     exts = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.heif'}
@@ -249,8 +311,7 @@ def score_directory(input_dir: str, output_csv: str):
         results.append({
             'filename': img_path.name,
             'filepath': str(img_path),
-            'aesthetic_score': round(score, 4),
-            'category': categorize(score)
+            'model_logit': round(score, 6),
         })
 
     if failed:
@@ -260,18 +321,65 @@ def score_directory(input_dir: str, output_csv: str):
         print("\nNo images scored.")
         return []
 
+    logit_list = [r['model_logit'] for r in results]
+    if getattr(scorer, "use_clip_only", False):
+        for r in results:
+            r['raw_score'] = round(max(1.0, min(10.0, float(r['model_logit']))), 4)
+        print("\nGlobal raw_score: CLIP fallback (already ~1–10; no LAION logit calibration).")
+    else:
+        for r in results:
+            r['raw_score'] = round(
+                laion_logit_to_raw_score_1_10(r['model_logit'], laion_center, laion_scale), 4
+            )
+        print(
+            f"\nGlobal raw_score: sigmoid map (logit − {laion_center}) / {laion_scale} → 1–10 "
+            f"(batch-independent; tune --laion-center / --laion-scale)"
+        )
+    print(f"  model_logit range: min={min(logit_list):.4f}, max={max(logit_list):.4f}")
+
+    # Within-folder ranking uses model logits (preserves model order; not z-scored)
+    if relative_scale and len(results) >= 2:
+        scaled = batch_percentile_scale_1_10(logit_list)
+        print(
+            f"Relative aesthetic_score: p5–p95 on model_logit → 1–10 "
+            f"(for sorting in this folder only)"
+        )
+    else:
+        scaled = [float(r['raw_score']) for r in results]
+        if len(results) == 1:
+            print("\nSingle image: aesthetic_score = raw_score.")
+
+    ranks = ranks_higher_better(scaled)
+    for i, r in enumerate(results):
+        r['aesthetic_score'] = round(scaled[i], 4)
+        r['rank'] = ranks[i]
+        r['category'] = categorize(float(r['raw_score']))
+
     # Save
     output_path = Path(output_csv)
+    fieldnames = [
+        'filename',
+        'filepath',
+        'model_logit',
+        'raw_score',
+        'aesthetic_score',
+        'rank',
+        'category',
+    ]
+    results.sort(key=lambda r: r['rank'])
     with open(output_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['filename', 'filepath', 'aesthetic_score', 'category'])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(results)
 
     # Stats
-    scores = [r['aesthetic_score'] for r in results]
+    rel = [r['aesthetic_score'] for r in results]
+    raw_vals = [float(r['raw_score']) for r in results]
     print(f"\n✓ Saved: {output_path}")
     print(f"Scored: {len(results)}")
-    print(f"\nScores: Mean={sum(scores)/len(scores):.2f}, Min={min(scores):.2f}, Max={max(scores):.2f}")
+    print(f"\nraw_score (global): Mean={sum(raw_vals)/len(raw_vals):.2f}, Min={min(raw_vals):.2f}, Max={max(raw_vals):.2f}")
+    print(f"aesthetic_score (folder-relative): Mean={sum(rel)/len(rel):.2f}, Min={min(rel):.2f}, Max={max(rel):.2f}")
+    print("`category` uses **raw_score** (global). `rank` uses **aesthetic_score** (relative).")
 
     # Categories
     cats = {}
@@ -279,7 +387,7 @@ def score_directory(input_dir: str, output_csv: str):
         cat = r['category']
         cats[cat] = cats.get(cat, 0) + 1
 
-    print("\nQuality:")
+    print("\nQuality (from global raw_score):")
     for cat, count in sorted(cats.items(), key=lambda x: x[1], reverse=True):
         emoji = "🔥" if cat == "exciting" else "😐" if cat == "moderate" else "😴"
         print(f"  {emoji} {cat}: {count} ({100*count/len(results):.1f}%)")
@@ -292,6 +400,25 @@ def main():
     parser.add_argument('input_dir', nargs='?', help='Directory with images')
     parser.add_argument('-o', '--output', help='Output CSV')
     parser.add_argument('--install', action='store_true', help='Install deps')
+    parser.add_argument(
+        '--no-relative-scale',
+        action='store_true',
+        help='Set aesthetic_score = raw_score (no within-folder percentile stretch)',
+    )
+    parser.add_argument(
+        '--laion-center',
+        type=float,
+        default=DEFAULT_LAION_LOGIT_CENTER,
+        metavar='X',
+        help=f'Logit value mapped to raw_score 5.5 (default {DEFAULT_LAION_LOGIT_CENTER})',
+    )
+    parser.add_argument(
+        '--laion-scale',
+        type=float,
+        default=DEFAULT_LAION_LOGIT_SCALE,
+        metavar='S',
+        help=f'Smaller = steeper raw_score vs logit (default {DEFAULT_LAION_LOGIT_SCALE})',
+    )
     args = parser.parse_args()
 
     if args.install:
@@ -325,7 +452,13 @@ def main():
     print("=" * 60)
     print()
 
-    score_directory(input_path, output_csv)
+    score_directory(
+        input_path,
+        output_csv,
+        relative_scale=not args.no_relative_scale,
+        laion_center=args.laion_center,
+        laion_scale=args.laion_scale,
+    )
 
     print("\n" + "=" * 60)
     print("✓ DONE")

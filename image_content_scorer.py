@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-Image Content Quality Scorer - Exciting vs Boring Detection
-Uses CLIP embeddings + simple MLP for aesthetic scoring.
+Image Content Quality Scorer — deterministic signals + batch-relative scaling.
+
+Uses EfficientNet/ResNet features, Laplacian sharpness, and color variation;
+z-scores within the folder, then maps p5–p95 to 1–10 for sortable scores.
 
 REQUIREMENTS:
-  pip install torch torchvision Pillow tqdm
+  pip install torch torchvision Pillow tqdm numpy
 
 For HEIC support:
   pip install pillow-heif
 
 USAGE:
-  python image_content_scorer.py <directory> [-o output.csv]
-
-MODEL:
-  - Uses CLIP ViT-B/32 (much smaller than ViT-L/14)
-  - Predicts aesthetic score based on learned features
-  - Score range: 1.0 (boring) to 10.0 (exciting)
+  python image_content_scorer.py <directory> [-o output.csv] [--no-relative-scale]
 """
 
 import os
@@ -107,6 +104,61 @@ import numpy as np
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 
+def laplacian_variance_gray(gray: np.ndarray) -> float:
+    """Variance of Laplacian (focus / edge energy); higher often means sharper photos."""
+    g = gray.astype(np.float64)
+    if g.shape[0] < 3 or g.shape[1] < 3:
+        return 0.0
+    lap = (
+        -4 * g[1:-1, 1:-1]
+        + g[:-2, 1:-1]
+        + g[2:, 1:-1]
+        + g[1:-1, :-2]
+        + g[1:-1, 2:]
+    )
+    return float(np.var(lap))
+
+
+def absolute_content_1_10(feat_mag: float, lap_var: float, color_std: float) -> float:
+    """
+    Batch-independent 1..10 score: each signal mapped to [0,1] with fixed ranges
+    (works when every image in a folder is similar quality).
+    """
+    f = min(1.0, max(0.0, math.log1p(max(0.0, feat_mag) * 120.0) / math.log1p(45.0)))
+    l = min(1.0, max(0.0, math.log1p(max(0.0, lap_var)) / math.log1p(700.0)))
+    c = min(1.0, max(0.0, float(color_std) / 50.0))
+    u = 0.4 * f + 0.35 * l + 0.25 * c
+    return 1.0 + 9.0 * u
+
+
+def batch_percentile_scale_1_10(scores, low_pct: float = 5.0, high_pct: float = 95.0):
+    n = len(scores)
+    if n == 0:
+        return []
+    if n == 1:
+        return [5.0]
+    t = torch.tensor(scores, dtype=torch.float64)
+    lo = torch.quantile(t, low_pct / 100.0).item()
+    hi = torch.quantile(t, high_pct / 100.0).item()
+    span = hi - lo
+    if span < 1e-9:
+        return [5.0] * n
+    out = []
+    for s in scores:
+        u = (s - lo) / span
+        u = max(0.0, min(1.0, u))
+        out.append(1.0 + 9.0 * u)
+    return out
+
+
+def ranks_higher_better(scores):
+    indexed = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    rank_by_pos = [0] * len(scores)
+    for r, (idx, _) in enumerate(indexed, start=1):
+        rank_by_pos[idx] = r
+    return rank_by_pos
+
+
 class ContentAestheticScorer:
     """
     Image content scorer using pretrained model features.
@@ -116,7 +168,6 @@ class ContentAestheticScorer:
     def __init__(self):
         self.device = DEVICE
         self.model = None
-        self.aesthetic_head = None
         self.transform = None
         self.load_model()
 
@@ -140,17 +191,8 @@ class ContentAestheticScorer:
             in_features = self.model.fc.in_features
             self.model.fc = nn.Identity()
 
-        # Aesthetic prediction head (2-layer MLP)
-        self.aesthetic_head = nn.Sequential(
-            nn.Linear(in_features, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 1)
-        ).to(self.device)
-
         self.model = self.model.to(self.device)
         self.model.eval()
-        self.aesthetic_head.eval()
 
         # Image preprocessing
         self.transform = transforms.Compose([
@@ -161,71 +203,34 @@ class ContentAestheticScorer:
                                std=[0.229, 0.224, 0.225])
         ])
 
-        # Try to load aesthetic weights if available
-        self._load_aesthetic_weights()
-
         print("✓ Model ready\n")
 
-    def _load_aesthetic_weights(self):
-        """Load pretrained aesthetic weights if available."""
-        # For now, use the pretrained ImageNet features
-        # The model will give reasonable scores based on learned features
-        # Higher-level features correlate with interesting content
-        pass
-
-    def score_image(self, image_path):
-        """Score a single image."""
+    def compute_metrics(self, image_path):
+        """
+        Backbone activation strength, Laplacian sharpness, color channel variation.
+        Combined into a batch-independent raw_score in score_directory.
+        """
         try:
-            # Load image
-            image = Image.open(image_path).convert('RGB')
-
-            # Preprocess
+            image = Image.open(image_path).convert("RGB")
+            img_array = np.array(image)
             img_tensor = self.transform(image).unsqueeze(0).to(self.device)
 
             with torch.no_grad():
-                # Extract features
                 features = self.model(img_tensor)
 
-                # Predict aesthetic score
-                score = self.aesthetic_head(features)
+            feat_mag = float(features.abs().mean().item())
+            gray = np.mean(img_array, axis=2)
+            lap_var = laplacian_variance_gray(gray)
+            if len(img_array.shape) == 3:
+                color_std = float(np.std(img_array, axis=(0, 1)).mean())
+            else:
+                color_std = float(np.std(img_array))
 
-            # Convert to 1-10 scale
-            raw = score.item()
-            # Apply sigmoid normalization and scale
-            normalized = torch.sigmoid(torch.tensor(raw)).item()
-            final_score = 1.0 + normalized * 9.0
-
-            # Adjust based on image characteristics
-            # More complex/diverse images tend to be more interesting
-            img_array = np.array(image)
-            complexity = self._estimate_complexity(img_array)
-
-            # Blend model score with complexity (70% model, 30% complexity)
-            final_score = 0.7 * final_score + 0.3 * complexity
-
-            return float(final_score)
+            return feat_mag, lap_var, color_std
 
         except Exception as e:
             print(f"  ✗ Error: {image_path.name}: {e}")
             return None
-
-    def _estimate_complexity(self, img_array):
-        """Estimate image complexity/diversity as proxy for interestingness."""
-        try:
-            # Simple metrics that correlate with interesting content
-            # Color diversity
-            if len(img_array.shape) == 3:
-                color_std = np.std(img_array, axis=(0,1)).mean()
-            else:
-                color_std = np.std(img_array)
-
-            # Normalize to 1-10 scale
-            # Higher color diversity = more interesting
-            complexity_score = 1.0 + min(9.0, color_std / 30.0)
-
-            return complexity_score
-        except:
-            return 5.0
 
 
 def categorize(score):
@@ -238,7 +243,7 @@ def categorize(score):
         return "boring/meaningless"
 
 
-def score_directory(input_dir, output_csv):
+def score_directory(input_dir, output_csv, relative_scale: bool = True):
     """Score all images in directory."""
     input_path = Path(input_dir)
     exts = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.heif'}
@@ -266,46 +271,73 @@ def score_directory(input_dir, output_csv):
 
     results = []
     failed = 0
+    metrics_rows = []
 
     for img_path in tqdm(files, desc="Scoring"):
-        score = scorer.score_image(img_path)
-        if score is None:
+        m = scorer.compute_metrics(img_path)
+        if m is None:
             failed += 1
             continue
-
-        results.append({
-            'filename': img_path.name,
-            'filepath': str(img_path),
-            'aesthetic_score': round(score, 4),
-            'category': categorize(score)
-        })
+        metrics_rows.append((img_path, m))
 
     if failed:
         print(f"\n⚠ {failed} images failed")
 
-    if not results:
+    if not metrics_rows:
         print("\nNo images scored.")
         return []
 
+    for img_path, m in metrics_rows:
+        feat_mag, lap_var, color_std = m
+        rs = absolute_content_1_10(feat_mag, lap_var, color_std)
+        results.append({
+            'filename': img_path.name,
+            'filepath': str(img_path),
+            'raw_score': round(rs, 4),
+        })
+
+    raw_list = [float(r['raw_score']) for r in results]
+    print(
+        "\nGlobal raw_score: fixed blend of log-scaled feature magnitude, Laplacian sharpness, "
+        "color std (no z-scores; valid for homogeneous folders)."
+    )
+    print(f"  raw_score range: min={min(raw_list):.4f}, max={max(raw_list):.4f}")
+
+    if relative_scale and len(results) >= 2:
+        scaled = batch_percentile_scale_1_10(raw_list)
+        print("Relative aesthetic_score: p5–p95 on raw_score → within-folder spread for sorting.")
+    else:
+        scaled = raw_list.copy()
+        if len(results) == 1:
+            print("\nSingle image: aesthetic_score = raw_score.")
+
+    ranks = ranks_higher_better(scaled)
+    for i, r in enumerate(results):
+        r['aesthetic_score'] = round(scaled[i], 4)
+        r['rank'] = ranks[i]
+        r['category'] = categorize(float(r['raw_score']))
+
     # Save
+    fieldnames = ['filename', 'filepath', 'raw_score', 'aesthetic_score', 'rank', 'category']
+    results.sort(key=lambda r: r['rank'])
     with open(output_csv, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['filename', 'filepath', 'aesthetic_score', 'category'])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(results)
 
-    # Stats
-    scores = [r['aesthetic_score'] for r in results]
+    rel = [r['aesthetic_score'] for r in results]
     print(f"\n✓ Saved: {output_csv}")
     print(f"Scored: {len(results)} images")
-    print(f"\nScores: Mean={sum(scores)/len(scores):.2f}, Min={min(scores):.2f}, Max={max(scores):.2f}")
+    print(f"\nraw_score (global): Mean={sum(raw_list)/len(raw_list):.2f}, Min={min(raw_list):.2f}, Max={max(raw_list):.2f}")
+    print(f"aesthetic_score (folder-relative): Mean={sum(rel)/len(rel):.2f}, Min={min(rel):.2f}, Max={max(rel):.2f}")
+    print("`category` uses **raw_score**. `rank` uses **aesthetic_score**.")
 
-    # Categories
     cats = {}
     for r in results:
         cat = r['category']
         cats[cat] = cats.get(cat, 0) + 1
 
-    print("\nQuality Breakdown:")
+    print("\nQuality Breakdown (from global raw_score):")
     for cat, count in sorted(cats.items(), key=lambda x: x[1], reverse=True):
         emoji = "🔥" if cat == "exciting" else "😐" if cat == "moderate" else "😴"
         print(f"  {emoji} {cat}: {count} ({100*count/len(results):.1f}%)")
@@ -317,6 +349,11 @@ def main():
     parser = argparse.ArgumentParser(description='Score image content quality')
     parser.add_argument('input_dir', nargs='?', help='Directory with images')
     parser.add_argument('-o', '--output', help='Output CSV path')
+    parser.add_argument(
+        '--no-relative-scale',
+        action='store_true',
+        help='Disable p5–p95 batch scaling (narrower aesthetic_score)',
+    )
     args = parser.parse_args()
 
     if not args.input_dir:
@@ -345,7 +382,7 @@ def main():
     print(f"HEIC: {'✓' if HEIC_SUPPORT else '✗'}")
     print("=" * 60)
 
-    score_directory(input_path, output_csv)
+    score_directory(input_path, output_csv, relative_scale=not args.no_relative_scale)
 
     print("\n" + "=" * 60)
     print("✓ COMPLETE")

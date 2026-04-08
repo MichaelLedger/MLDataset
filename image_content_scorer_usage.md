@@ -1,6 +1,6 @@
 # `image_content_scorer.py` — usage
 
-Scores images with a **lightweight content / “interestingness” heuristic**: ImageNet-pretrained backbone features, a small trainable-style MLP head (randomly initialized in this script), plus a **color-complexity** blend. Outputs are on a **1–10** scale for comparison with the other scorer, but this is **not** the same as the LAION human-rating model.
+Scores images with a **lightweight, deterministic** heuristic: ImageNet backbone **feature magnitude**, **Laplacian sharpness**, and **color variation** are mapped to **raw_score** with **fixed** ranges (no z-scores), then optionally **percentile-mapped** within the folder for `aesthetic_score`. This is **not** the LAION human-rating model.
 
 ## Requirements
 
@@ -34,6 +34,7 @@ python image_content_scorer.py ./my_images
 |----------|-------------|
 | `input_dir` | Directory containing images (required). Only **direct** children are scored (not subfolders). |
 | `-o`, `--output` | Path to the output CSV. If omitted, see **Default output path** below. |
+| `--no-relative-scale` | Skip p5–p95 batch mapping; `aesthetic_score` becomes a clamped shift of the composite z-score (narrower spread). |
 
 There is no `--install` flag; dependency handling is interactive when imports fail.
 
@@ -61,8 +62,10 @@ Columns:
 |--------|---------|
 | `filename` | Base name of the image |
 | `filepath` | Full path to the image |
-| `aesthetic_score` | Numeric score (1–10 after blending) |
-| `category` | `exciting`, `moderate`, or `boring/meaningless` |
+| `raw_score` | **Global** 1–10: fixed blend of log-scaled backbone magnitude, Laplacian sharpness, and color std (no z-scores, so it still works if every image in the folder looks the same). |
+| `aesthetic_score` | **Default:** p5–p95 of `raw_score` within the folder for extra spread when sorting. |
+| `rank` | `1` = best in this folder (`aesthetic_score`). |
+| `category` | From **global** `raw_score`. |
 
 ## Score categories
 
@@ -74,9 +77,9 @@ Columns:
 
 ## How scoring works (implementation summary)
 
-1. **Backbone:** Prefer **EfficientNet-B0** with ImageNet weights (`torchvision`); on failure, **ResNet50** with ImageNet weights.
-2. **Head:** A small MLP maps pooled features to one logit; weights are **not** loaded from an external aesthetic checkpoint (`_load_aesthetic_weights` is a no-op).
-3. **Post-processing:** Sigmoid maps the logit toward 1–10, then the result is blended with a simple **color diversity / “complexity”** score (70% model-like signal, 30% complexity).
+1. **Backbone:** **EfficientNet-B0** (ImageNet weights) or **ResNet50** fallback; classifier replaced with identity; **global** embedding vectors are used.
+2. **Signals (per image):** mean absolute activation, Laplacian variance (grayscale), mean RGB channel std — each mapped to [0, 1] with **fixed** log/linear ranges (not z-scored).
+3. **raw_score:** `1 + 9 ×` weighted blend (0.4 / 0.35 / 0.25). **aesthetic_score:** optional second pass, p5–p95 on `raw_score` in this folder.
 
 Use this script when you want something **fast and local** without Hugging Face LAION downloads. For **human-calibrated aesthetic** scores, prefer `laion_aesthetic_scorer.py`.
 
